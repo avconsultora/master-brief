@@ -179,26 +179,63 @@ async def fill_brief(request: Request, authorization: str = Header(None)):
     if expected and authorization != expected:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # Aceptar tanto {"user_data": {...}} como body plano {...}
+    user_data: Dict[str, Any] = {}
+
+    # 1) Intento A: JSON body
     try:
         payload = await request.json()
-    except Exception:
-        payload = {}
-
-    if isinstance(payload, dict) and "user_data" in payload and isinstance(payload["user_data"], dict):
-        user_data = payload["user_data"]
-    elif isinstance(payload, dict):
-        user_data = payload  # fallback: tomar todo el body como user_data
-    else:
-        user_data = {}
-
-    # Debug acotado
-    try:
-        print("DEBUG /brief/fill keys (raw):", list(user_data.keys())[:8])
+        if isinstance(payload, dict):
+            if "user_data" in payload and isinstance(payload["user_data"], dict):
+                user_data = payload["user_data"]
+            elif payload:  # body plano
+                user_data = payload
     except Exception:
         pass
 
-    # Cargar plantilla y fields por request (evita estado global)
+    # 2) Intento B: querystring (?user_data=... o keys sueltas)
+    if not user_data:
+        try:
+            qs = dict(request.query_params)
+            if "user_data" in qs:
+                # puede venir como string JSON
+                try:
+                    ud = json.loads(qs["user_data"])
+                    if isinstance(ud, dict):
+                        user_data = ud
+                except Exception:
+                    # si vino como “key1=..&key2=..” plano, no JSON
+                    user_data = {}
+            else:
+                # quizá mandaron todas las keys como params sueltos
+                if qs:
+                    user_data = qs
+        except Exception:
+            pass
+
+    # 3) Intento C: form (application/x-www-form-urlencoded o multipart)
+    if not user_data:
+        try:
+            form = await request.form()
+            if "user_data" in form:
+                try:
+                    ud = json.loads(form["user_data"])
+                    if isinstance(ud, dict):
+                        user_data = ud
+                except Exception:
+                    user_data = {}
+            else:
+                if form:
+                    user_data = dict(form)
+        except Exception:
+            pass
+
+    # Debug acotado
+    try:
+        print("DEBUG /brief/fill keys (ingest):", list(user_data.keys())[:8])
+    except Exception:
+        pass
+
+    # Plantilla y fields
     template_text, template_lines = read_template()
     fields = extract_fields(template_lines)
     if not fields:
@@ -208,9 +245,9 @@ async def fill_brief(request: Request, authorization: str = Header(None)):
     expected_keys = [f["key"] for f in fields]
     user_data_norm = normalize_user_data_to_keys(user_data, expected_keys)
 
-    # Obtener data con el modelo (rellena faltantes con "Sin datos")
+    # Llamada al modelo → JSON con exactamente esas keys (faltantes = "Sin datos")
     data = call_model_to_get_json(fields, user_data_norm)
 
-    # Armar markdown 1:1 con la plantilla
+    # Armar markdown espejo 1:1
     md = assemble_markdown(template_lines, fields, data)
     return FillResponse(markdown=md)
