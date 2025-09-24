@@ -32,6 +32,11 @@ from dotenv import load_dotenv
 from slugify import slugify
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel
+
+from typing import List
+
+class KeysResponse(BaseModel):
+    keys: List[str]
 from openai import OpenAI
 
 # ====== Carga de entorno ======
@@ -174,11 +179,13 @@ def call_model_to_get_json(fields, payload: Dict[str, Any]) -> Dict[str, str]:
 def health():
     return {"ok": True, "version": "1.0.4"}
 
-@app.get("/brief/keys")
+@app.get("/brief/keys", response_model=KeysResponse)
 def brief_keys():
     _, lines = read_template()
     fields = extract_fields(lines)
-    return {"keys": [f["key"] for f in fields]}
+    return KeysResponse(keys=[f["key"] for f in fields])
+
+
 
 @app.post("/brief/fill", response_model=FillResponse)
 async def fill_brief(request: Request, authorization: str = Header(None)):
