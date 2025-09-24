@@ -1,3 +1,26 @@
+import difflib
+
+def normalize_user_data_to_keys(user_data: Dict[str, Any], expected_keys: List[str]) -> Dict[str, Any]:
+    """
+    Acepta alias con acentos/variantes y las mapea a las keys exactas (sin acentos) de expected_keys.
+    Regla: slugify(k_in) -> match exacto; si no hay, best match por ratio >= 0.8; sino se ignora.
+    """
+    norm_expected = {slugify(k, separator="_"): k for k in expected_keys}
+    out = {k: "Sin datos" for k in expected_keys}
+
+    for k_in, v in (user_data or {}).items():
+        slug_in = slugify(str(k_in), separator="_")
+        if slug_in in norm_expected:
+            out[norm_expected[slug_in]] = v
+            continue
+        # buscar mejor parecido
+        candidates = list(norm_expected.keys())
+        best = difflib.get_close_matches(slug_in, candidates, n=1, cutoff=0.8)
+        if best:
+            out[norm_expected[best[0]]] = v
+        # si no hay match, se descarta (no agregamos keys desconocidas)
+    return out
+
 # app.py
 import os
 import re
@@ -104,6 +127,16 @@ Reglas:
 - No inventes datos sensibles ni números sin evidencia.
 - Devolvé un JSON con EXACTAMENTE las KEYS indicadas (sin keys extra).
 """
+
+template_text, template_lines = read_template()
+fields = extract_fields(template_lines)
+if not fields:
+    raise HTTPException(status_code=400, detail="No se detectaron campos...")
+
+expected = [f["key"] for f in fields]
+user_data = normalize_user_data_to_keys(user_data, expected)  # 👈 normaliza alias
+
+data = call_model_to_get_json(fields, user_data)
 
 # ====== Llamada a OpenAI (Chat Completions + JSON mode) ======
 def call_model_to_get_json(fields, payload: Dict[str, Any]) -> Dict[str, str]:
