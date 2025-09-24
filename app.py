@@ -1,62 +1,35 @@
-import difflib
-
-def normalize_user_data_to_keys(user_data: Dict[str, Any], expected_keys: List[str]) -> Dict[str, Any]:
-    """
-    Acepta alias con acentos/variantes y las mapea a las keys exactas (sin acentos) de expected_keys.
-    Regla: slugify(k_in) -> match exacto; si no hay, best match por ratio >= 0.8; sino se ignora.
-    """
-    norm_expected = {slugify(k, separator="_"): k for k in expected_keys}
-    out = {k: "Sin datos" for k in expected_keys}
-
-    for k_in, v in (user_data or {}).items():
-        slug_in = slugify(str(k_in), separator="_")
-        if slug_in in norm_expected:
-            out[norm_expected[slug_in]] = v
-            continue
-        # buscar mejor parecido
-        candidates = list(norm_expected.keys())
-        best = difflib.get_close_matches(slug_in, candidates, n=1, cutoff=0.8)
-        if best:
-            out[norm_expected[best[0]]] = v
-        # si no hay match, se descarta (no agregamos keys desconocidas)
-    return out
-
 # app.py
 import os
 import re
 import json
 import pathlib
-from typing import Any, Dict, List
+import difflib
+from typing import Dict, Any, List
 
 from dotenv import load_dotenv
 from slugify import slugify
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel
-
-from typing import List
-
-class KeysResponse(BaseModel):
-    keys: List[str]
 from openai import OpenAI
 
-# ====== Carga de entorno ======
+# ========= Entorno / cliente OpenAI =========
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-SERVICE_TOKEN = os.getenv("SERVICE_TOKEN", "")  # <-- setear en Render/Local (.env)
+SERVICE_TOKEN = os.getenv("SERVICE_TOKEN", "avbrief123")  # default para conveniencia
 
 if not OPENAI_API_KEY:
     raise RuntimeError("Falta OPENAI_API_KEY")
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ====== Paths ======
+# ========= Paths / plantilla =========
 ROOT = pathlib.Path(__file__).resolve().parent
 TPL_PATH = ROOT / "Plantilla_MD.md"
 
-# ====== App ======
+# ========= FastAPI =========
 app = FastAPI(title="AV Brief Filler", version="1.0.4")
 
-# ====== Regex helpers ======
+# ========= Regex para detectar campos "Etiqueta:" =========
 LABEL_RE = re.compile(
     r"""^(\s*(?:[-*+]\s+|\d+\.\s+)?)      # bullet opcional
         (?:\*\*)?                         # ** opcional
@@ -67,24 +40,27 @@ LABEL_RE = re.compile(
     re.X,
 )
 
-# ====== Modelos ======
+# ========= Models (Pydantic) =========
 class FillResponse(BaseModel):
     markdown: str
 
-# ====== Utilidades de plantilla ======
-def read_template():
+class KeysResponse(BaseModel):
+    keys: List[str]
+
+# ========= Utilidades =========
+def read_template() -> tuple[str, List[str]]:
     if not TPL_PATH.exists():
         raise RuntimeError("No se encontró Plantilla_MD.md en la raíz del proyecto.")
     text = TPL_PATH.read_text(encoding="utf-8")
     return text, text.splitlines()
 
-def extract_fields(lines: List[str]):
+def extract_fields(lines: List[str]) -> List[Dict[str, Any]]:
     """
     Devuelve lista de dicts:
     [{"line_idx": int, "raw_label": "Cliente/Marca", "key": "cliente_marca"}, ...]
     Detecta toda línea que termine con ":" (sea bullet o no).
     """
-    fields = []
+    fields: List[Dict[str, Any]] = []
     for i, ln in enumerate(lines):
         m = LABEL_RE.match(ln)
         if m:
@@ -105,7 +81,7 @@ def ensure_value(v: Any) -> str:
     v = str(v).strip()
     return v if v else "Sin datos"
 
-def assemble_markdown(template_lines: List[str], fields, data: Dict[str, Any]) -> str:
+def assemble_markdown(template_lines: List[str], fields: List[Dict[str, Any]], data: Dict[str, Any]) -> str:
     """
     Inserta cada valor en la MISMA línea (después de los dos puntos).
     Conserva labels con espacios (p.ej. 'Razón social:').
@@ -123,7 +99,29 @@ def assemble_markdown(template_lines: List[str], fields, data: Dict[str, Any]) -
             out[f["line_idx"]] = base + " " + val
     return "\n".join(out) + "\n"
 
-# ====== Reglas del sistema ======
+def normalize_user_data_to_keys(user_data: Dict[str, Any], expected_keys: List[str]) -> Dict[str, Any]:
+    """
+    Acepta alias con acentos/variantes y las mapea a las keys exactas (sin acentos) de expected_keys.
+    Regla: slugify(k_in) -> match exacto; si no hay, best match por ratio >= 0.8; sino se ignora.
+    Además, inicializa todas las keys esperadas en "Sin datos" para evitar faltantes.
+    """
+    norm_expected = {slugify(k, separator="_"): k for k in expected_keys}
+    out = {k: "Sin datos" for k in expected_keys}
+
+    for k_in, v in (user_data or {}).items():
+        slug_in = slugify(str(k_in), separator="_")
+        if slug_in in norm_expected:
+            out[norm_expected[slug_in]] = v
+            continue
+        # best-effort por similitud
+        candidates = list(norm_expected.keys())
+        best = difflib.get_close_matches(slug_in, candidates, n=1, cutoff=0.8)
+        if best:
+            out[norm_expected[best[0]]] = v
+        # si no hay match, se ignora (no agregamos keys desconocidas)
+    return out
+
+# ========= Reglas del sistema para el modelo =========
 SYSTEM_RULES = """Sos un asistente que rellena un brief y responde SOLO en JSON (objeto).
 Reglas:
 - Prioridad: (1) Usuario, (2) Sitio oficial, (3) Secundarias confiables.
@@ -133,18 +131,7 @@ Reglas:
 - Devolvé un JSON con EXACTAMENTE las KEYS indicadas (sin keys extra).
 """
 
-template_text, template_lines = read_template()
-fields = extract_fields(template_lines)
-if not fields:
-    raise HTTPException(status_code=400, detail="No se detectaron campos...")
-
-expected = [f["key"] for f in fields]
-user_data = normalize_user_data_to_keys(user_data, expected)  # 👈 normaliza alias
-
-data = call_model_to_get_json(fields, user_data)
-
-# ====== Llamada a OpenAI (Chat Completions + JSON mode) ======
-def call_model_to_get_json(fields, payload: Dict[str, Any]) -> Dict[str, str]:
+def call_model_to_get_json(fields: List[Dict[str, Any]], payload: Dict[str, Any]) -> Dict[str, str]:
     keys_list = [f["key"] for f in fields]
     user_text = json.dumps(payload, ensure_ascii=False, indent=2)
 
@@ -167,14 +154,14 @@ def call_model_to_get_json(fields, payload: Dict[str, Any]) -> Dict[str, str]:
         )
         raw = resp.choices[0].message.content
         data = json.loads(raw)
-        # Sanitizar: solo keys esperadas
+        # Sanitiza: solo keys esperadas, rellena faltantes
         return {k: ensure_value(data.get(k, "Sin datos")) for k in keys_list}
     except Exception as e:
         # Log mínimo, sin secretos
         print("ERROR OpenAI (chat.completions):", repr(e))
         return {k: "Sin datos" for k in keys_list}
 
-# ====== Endpoints ======
+# ========= Endpoints =========
 @app.get("/health")
 def health():
     return {"ok": True, "version": "1.0.4"}
@@ -184,8 +171,6 @@ def brief_keys():
     _, lines = read_template()
     fields = extract_fields(lines)
     return KeysResponse(keys=[f["key"] for f in fields])
-
-
 
 @app.post("/brief/fill", response_model=FillResponse)
 async def fill_brief(request: Request, authorization: str = Header(None)):
@@ -209,15 +194,23 @@ async def fill_brief(request: Request, authorization: str = Header(None)):
 
     # Debug acotado
     try:
-        print("DEBUG /brief/fill keys:", list(user_data.keys())[:8])
+        print("DEBUG /brief/fill keys (raw):", list(user_data.keys())[:8])
     except Exception:
         pass
 
+    # Cargar plantilla y fields por request (evita estado global)
     template_text, template_lines = read_template()
     fields = extract_fields(template_lines)
     if not fields:
         raise HTTPException(status_code=400, detail="No se detectaron campos 'Etiqueta:' que terminen con ':' en la plantilla")
 
-    data = call_model_to_get_json(fields, user_data)
+    # Normalizar alias/acentos a keys esperadas
+    expected_keys = [f["key"] for f in fields]
+    user_data_norm = normalize_user_data_to_keys(user_data, expected_keys)
+
+    # Obtener data con el modelo (rellena faltantes con "Sin datos")
+    data = call_model_to_get_json(fields, user_data_norm)
+
+    # Armar markdown 1:1 con la plantilla
     md = assemble_markdown(template_lines, fields, data)
     return FillResponse(markdown=md)
