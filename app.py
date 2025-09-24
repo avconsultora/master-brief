@@ -4,32 +4,20 @@ import re
 import json
 import pathlib
 import difflib
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 
-from dotenv import load_dotenv
 from slugify import slugify
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel
-from openai import OpenAI
 
-# ========= Entorno / cliente OpenAI =========
-load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-SERVICE_TOKEN = os.getenv("SERVICE_TOKEN", "avbrief123")  # default para conveniencia
-
-if not OPENAI_API_KEY:
-    raise RuntimeError("Falta OPENAI_API_KEY")
-client = OpenAI(api_key=OPENAI_API_KEY)
-
-# ========= Paths / plantilla =========
+# ========= Config / Paths =========
+SERVICE_TOKEN = os.getenv("SERVICE_TOKEN", "avbrief123")  # default útil en dev
 ROOT = pathlib.Path(__file__).resolve().parent
 TPL_PATH = ROOT / "Plantilla_MD.md"
 
-# ========= FastAPI =========
-app = FastAPI(title="AV Brief Filler", version="1.0.4")
+app = FastAPI(title="AV Brief Filler", version="1.0.5")
 
-# ========= Regex para detectar campos "Etiqueta:" =========
+# ========= Regex para detectar líneas tipo "Etiqueta:" =========
 LABEL_RE = re.compile(
     r"""^(\s*(?:[-*+]\s+|\d+\.\s+)?)      # bullet opcional
         (?:\*\*)?                         # ** opcional
@@ -40,7 +28,7 @@ LABEL_RE = re.compile(
     re.X,
 )
 
-# ========= Models (Pydantic) =========
+# ========= Modelos =========
 class FillResponse(BaseModel):
     markdown: str
 
@@ -48,7 +36,7 @@ class KeysResponse(BaseModel):
     keys: List[str]
 
 # ========= Utilidades =========
-def read_template() -> tuple[str, List[str]]:
+def read_template() -> Tuple[str, List[str]]:
     if not TPL_PATH.exists():
         raise RuntimeError("No se encontró Plantilla_MD.md en la raíz del proyecto.")
     text = TPL_PATH.read_text(encoding="utf-8")
@@ -56,9 +44,8 @@ def read_template() -> tuple[str, List[str]]:
 
 def extract_fields(lines: List[str]) -> List[Dict[str, Any]]:
     """
-    Devuelve lista de dicts:
-    [{"line_idx": int, "raw_label": "Cliente/Marca", "key": "cliente_marca"}, ...]
-    Detecta toda línea que termine con ":" (sea bullet o no).
+    Devuelve dicts con posición de línea y key slug:
+      [{"line_idx": int, "raw_label": "Cliente/Marca", "key": "cliente_marca"}, ...]
     """
     fields: List[Dict[str, Any]] = []
     for i, ln in enumerate(lines):
@@ -70,7 +57,7 @@ def extract_fields(lines: List[str]) -> List[Dict[str, Any]]:
     return fields
 
 def ensure_value(v: Any) -> str:
-    """Si el valor está vacío, devuelve 'Sin datos'. Si es dict/list, lo serializa."""
+    """Devuelve 'Sin datos' si viene vacío. Dict/list -> JSON string."""
     if v is None:
         return "Sin datos"
     if isinstance(v, (dict, list)):
@@ -83,15 +70,15 @@ def ensure_value(v: Any) -> str:
 
 def assemble_markdown(template_lines: List[str], fields: List[Dict[str, Any]], data: Dict[str, Any]) -> str:
     """
-    Inserta cada valor en la MISMA línea (después de los dos puntos).
-    Conserva labels con espacios (p.ej. 'Razón social:').
+    Inserta cada valor en la MISMA línea (después de ':') manteniendo la plantilla.
     """
-    out = template_lines[:]  # copia
+    out = template_lines[:]  # copia superficial
     for f in fields:
         line = out[f["line_idx"]]
         val = ensure_value(data.get(f["key"], ""))
         idx = line.rfind(":")
         if idx == -1:
+            # por compatibilidad si alguna línea terminó sin ':'
             base = line.rstrip()
             out[f["line_idx"]] = base + " " + val
         else:
@@ -101,9 +88,10 @@ def assemble_markdown(template_lines: List[str], fields: List[Dict[str, Any]], d
 
 def normalize_user_data_to_keys(user_data: Dict[str, Any], expected_keys: List[str]) -> Dict[str, Any]:
     """
-    Acepta alias con acentos/variantes y las mapea a las keys exactas (sin acentos) de expected_keys.
-    Regla: slugify(k_in) -> match exacto; si no hay, best match por ratio >= 0.8; sino se ignora.
-    Además, inicializa todas las keys esperadas en "Sin datos" para evitar faltantes.
+    Acepta alias (con/sin acentos, variantes) y los mapea a las keys exactas de expected_keys.
+    - slugify(k_in) -> match exacto
+    - si no, best-match difflib con cutoff 0.8
+    - inicia todas las keys en "Sin datos"
     """
     norm_expected = {slugify(k, separator="_"): k for k in expected_keys}
     out = {k: "Sin datos" for k in expected_keys}
@@ -113,58 +101,66 @@ def normalize_user_data_to_keys(user_data: Dict[str, Any], expected_keys: List[s
         if slug_in in norm_expected:
             out[norm_expected[slug_in]] = v
             continue
-        # best-effort por similitud
-        candidates = list(norm_expected.keys())
-        best = difflib.get_close_matches(slug_in, candidates, n=1, cutoff=0.8)
+        best = difflib.get_close_matches(slug_in, list(norm_expected.keys()), n=1, cutoff=0.8)
         if best:
             out[norm_expected[best[0]]] = v
-        # si no hay match, se ignora (no agregamos keys desconocidas)
+        # si no hay match, se ignora la key desconocida
     return out
 
-# ========= Reglas del sistema para el modelo =========
-SYSTEM_RULES = """Sos un asistente que rellena un brief y responde SOLO en JSON (objeto).
-Reglas:
-- Prioridad: (1) Usuario, (2) Sitio oficial, (3) Secundarias confiables.
-- Si falta info: devolver el string EXACTO "Sin datos".
-- Si hay contradicción fuerte con el usuario: usar el dato del usuario y agregar " (verificar internamente)" al final del valor.
-- No inventes datos sensibles ni números sin evidencia.
-- Devolvé un JSON con EXACTAMENTE las KEYS indicadas (sin keys extra).
-"""
-
-def call_model_to_get_json(fields: List[Dict[str, Any]], payload: Dict[str, Any]) -> Dict[str, str]:
-    keys_list = [f["key"] for f in fields]
-    user_text = json.dumps(payload, ensure_ascii=False, indent=2)
-
-    messages = [
-        {"role": "system", "content": SYSTEM_RULES},
-        {"role": "user", "content":
-            "Estas son las KEYS a completar (usar EXACTAMENTE estas, sin agregar otras):\n"
-            + ", ".join(keys_list)
-            + "\n\nDatos del usuario/hallazgos (pueden estar incompletos):\n"
-            + user_text
-            + "\n\nDevolvé SOLO JSON válido (sin texto adicional)."}
-    ]
-
+async def ingest_user_data(request: Request) -> Dict[str, Any]:
+    """
+    Ingesta flexible:
+      1) JSON: {"user_data": {...}} o body plano {...}
+      2) Query: ?user_data={...} o ?key=value
+      3) Form: user_data={...} o campos sueltos
+    """
+    # 1) JSON
     try:
-        resp = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=messages,
-            response_format={"type": "json_object"},
-            temperature=0
-        )
-        raw = resp.choices[0].message.content
-        data = json.loads(raw)
-        # Sanitiza: solo keys esperadas, rellena faltantes
-        return {k: ensure_value(data.get(k, "Sin datos")) for k in keys_list}
-    except Exception as e:
-        # Log mínimo, sin secretos
-        print("ERROR OpenAI (chat.completions):", repr(e))
-        return {k: "Sin datos" for k in keys_list}
+        payload = await request.json()
+        if isinstance(payload, dict):
+            if "user_data" in payload and isinstance(payload["user_data"], dict):
+                return payload["user_data"]
+            if payload:
+                return payload
+    except Exception:
+        pass
+
+    # 2) Querystring
+    try:
+        qs = dict(request.query_params)
+        if "user_data" in qs:
+            try:
+                ud = json.loads(qs["user_data"])
+                if isinstance(ud, dict):
+                    return ud
+            except Exception:
+                return {}
+        elif qs:
+            return qs
+    except Exception:
+        pass
+
+    # 3) Form
+    try:
+        form = await request.form()
+        if "user_data" in form:
+            try:
+                ud = json.loads(form["user_data"])
+                if isinstance(ud, dict):
+                    return ud
+            except Exception:
+                return {}
+        elif form:
+            return dict(form)
+    except Exception:
+        pass
+
+    return {}
 
 # ========= Endpoints =========
 @app.get("/health")
 def health():
-    return {"ok": True, "version": "1.0.4"}
+    return {"ok": True, "version": "1.0.5"}
 
 @app.get("/brief/keys", response_model=KeysResponse)
 def brief_keys():
@@ -174,80 +170,32 @@ def brief_keys():
 
 @app.post("/brief/fill", response_model=FillResponse)
 async def fill_brief(request: Request, authorization: str = Header(None)):
-    # Auth simple tipo Bearer (no logueamos el token por seguridad)
+    # Auth tipo Bearer
     expected = f"Bearer {SERVICE_TOKEN}" if SERVICE_TOKEN else None
     if expected and authorization != expected:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    user_data: Dict[str, Any] = {}
-
-    # 1) Intento A: JSON body
-    try:
-        payload = await request.json()
-        if isinstance(payload, dict):
-            if "user_data" in payload and isinstance(payload["user_data"], dict):
-                user_data = payload["user_data"]
-            elif payload:  # body plano
-                user_data = payload
-    except Exception:
-        pass
-
-    # 2) Intento B: querystring (?user_data=... o keys sueltas)
-    if not user_data:
-        try:
-            qs = dict(request.query_params)
-            if "user_data" in qs:
-                # puede venir como string JSON
-                try:
-                    ud = json.loads(qs["user_data"])
-                    if isinstance(ud, dict):
-                        user_data = ud
-                except Exception:
-                    # si vino como “key1=..&key2=..” plano, no JSON
-                    user_data = {}
-            else:
-                # quizá mandaron todas las keys como params sueltos
-                if qs:
-                    user_data = qs
-        except Exception:
-            pass
-
-    # 3) Intento C: form (application/x-www-form-urlencoded o multipart)
-    if not user_data:
-        try:
-            form = await request.form()
-            if "user_data" in form:
-                try:
-                    ud = json.loads(form["user_data"])
-                    if isinstance(ud, dict):
-                        user_data = ud
-                except Exception:
-                    user_data = {}
-            else:
-                if form:
-                    user_data = dict(form)
-        except Exception:
-            pass
-
-    # Debug acotado
+    # 1) Ingesta de user_data
+    user_data = await ingest_user_data(request)
     try:
         print("DEBUG /brief/fill keys (ingest):", list(user_data.keys())[:8])
     except Exception:
         pass
 
-    # Plantilla y fields
+    # 2) Leer plantilla y extraer keys oficiales
     template_text, template_lines = read_template()
     fields = extract_fields(template_lines)
     if not fields:
-        raise HTTPException(status_code=400, detail="No se detectaron campos 'Etiqueta:' que terminen con ':' en la plantilla")
-
-    # Normalizar alias/acentos a keys esperadas
+        raise HTTPException(
+            status_code=400,
+            detail="No se detectaron campos 'Etiqueta:' que terminen con ':' en la plantilla",
+        )
     expected_keys = [f["key"] for f in fields]
-    user_data_norm = normalize_user_data_to_keys(user_data, expected_keys)
 
-    # Llamada al modelo → JSON con exactamente esas keys (faltantes = "Sin datos")
-    data = call_model_to_get_json(fields, user_data_norm)
+    # 3) Normalizar alias -> keys oficiales y completar faltantes con "Sin datos"
+    normalized = normalize_user_data_to_keys(user_data, expected_keys)
+    data = {k: ensure_value(normalized.get(k, "Sin datos")) for k in expected_keys}
 
-    # Armar markdown espejo 1:1
+    # 4) Volcar en plantilla (espejo 1:1, misma línea)
     md = assemble_markdown(template_lines, fields, data)
     return FillResponse(markdown=md)
