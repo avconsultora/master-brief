@@ -23,7 +23,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 ROOT = pathlib.Path(__file__).resolve().parent
 TPL_PATH = ROOT / "Plantilla_MD.md"
 
-app = FastAPI(title="AV Brief Filler", version="1.0.6")
+app = FastAPI(title="AV Brief Filler", version="1.0.7")
 
 # ========= Regex para detectar líneas tipo "Etiqueta:" =========
 LABEL_RE = re.compile(
@@ -140,8 +140,8 @@ async def ingest_user_data(request: Request) -> Dict[str, Any]:
 SYSTEM_RULES = """Sos un asistente que rellena un brief y responde SOLO en JSON (objeto).
 Reglas:
 - Prioridad: (1) Usuario, (2) Sitio oficial, (3) Secundarias confiables.
-- Si falta info: devolver el string EXACTO "Sin datos".
-- Si hay contradicción fuerte con el usuario: usar el dato del usuario y agregar " (verificar internamente)".
+- Si falta info: devolvé el string EXACTO "Sin datos".
+- Si hay contradicción fuerte con el usuario: usá el dato del usuario y agregá " (verificar internamente)".
 - No inventes datos sensibles ni números sin evidencia.
 - Devolvé un JSON con EXACTAMENTE las KEYS indicadas (sin keys extra).
 """
@@ -163,10 +163,11 @@ def call_model_to_get_json(fields: List[Dict[str, Any]], payload: Dict[str, Any]
             model=OPENAI_MODEL,
             messages=messages,
             response_format={"type": "json_object"},
-            temperature=0
+            temperature=0.2
         )
         raw = resp.choices[0].message.content
         data = json.loads(raw)
+        # Aseguramos que todas las keys existan
         return {k: ensure_value(data.get(k, "Sin datos")) for k in keys_list}
     except Exception as e:
         print("ERROR OpenAI:", repr(e))
@@ -175,7 +176,7 @@ def call_model_to_get_json(fields: List[Dict[str, Any]], payload: Dict[str, Any]
 # ========= Endpoints =========
 @app.get("/health")
 def health():
-    return {"ok": True, "version": "1.0.6"}
+    return {"ok": True, "version": "1.0.7"}
 
 @app.get("/brief/keys", response_model=KeysResponse)
 def brief_keys():
@@ -203,7 +204,7 @@ async def fill_brief(request: Request, authorization: str = Header(None)):
     expected_keys = [f["key"] for f in fields]
     normalized = normalize_user_data_to_keys(user_data, expected_keys)
 
-    # Aquí entra la IA a completar lo que falta
+    # 🚀 Acá entra la IA para completar lo faltante
     data = call_model_to_get_json(fields, normalized)
 
     md = assemble_markdown(template_lines, fields, data)
