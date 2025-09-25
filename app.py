@@ -1,69 +1,42 @@
 # app.py
-import os
-import re
-import json
-import pathlib
-import difflib
-import logging
-from typing import Dict, Any, List, Tuple
+import os, re, json, pathlib, difflib, logging
+from typing import Dict, Any, List, Tuple, Optional
 
+import httpx
 from slugify import slugify
-from fastapi import FastAPI, Header, HTTPException, Request, Query
+from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel
 from openai import OpenAI
 
-# ========= Logging =========
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-)
-logger = logging.getLogger("av-brief")
+# ===== Logging =====
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("av-brief")
 
-# ========= Config =========
+# ===== Config =====
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # <- GUION, no punto
 SERVICE_TOKEN = os.getenv("SERVICE_TOKEN", "avbrief123")
-
-# autocorrección común: gpt-4o.mini -> gpt-4o-mini
-if "." in OPENAI_MODEL and "-" not in OPENAI_MODEL:
-    corrected = OPENAI_MODEL.replace(".", "-")
-    logger.warning("OPENAI_MODEL corregido de '%s' a '%s'", OPENAI_MODEL, corrected)
-    OPENAI_MODEL = corrected
 
 if not OPENAI_API_KEY:
     raise RuntimeError("Falta OPENAI_API_KEY")
-
-try:
-    client = OpenAI(api_key=OPENAI_API_KEY)
-    logger.info("OpenAI client inicializado. Modelo: %s", OPENAI_MODEL)
-except Exception as e:
-    logger.exception("No se pudo inicializar OpenAI client: %r", e)
-    raise
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 ROOT = pathlib.Path(__file__).resolve().parent
 TPL_PATH = ROOT / "Plantilla_MD.md"
 
 app = FastAPI(title="AV Brief Filler", version="1.0.8")
 
-# ========= Regex para detectar líneas tipo "Etiqueta:" =========
 LABEL_RE = re.compile(
-    r"""^(\s*(?:[-*+]\s+|\d+\.\s+)?)      # bullet opcional
-        (?:\*\*)?                         # ** opcional
-        ([^:*]+?)                         # etiqueta
-        (?:\*\*)?
-        \s*:\s*$                          # termina en :
-    """,
+    r"""^(\s*(?:[-*+]\s+|\d+\.\s+)?) (?:\*\*)? ([^:*]+?) (?:\*\*)? \s*:\s*$""",
     re.X,
 )
 
-# ========= Modelos =========
 class FillResponse(BaseModel):
     markdown: str
 
 class KeysResponse(BaseModel):
     keys: List[str]
 
-# ========= Utilidades =========
 def read_template() -> Tuple[str, List[str]]:
     if not TPL_PATH.exists():
         raise RuntimeError("No se encontró Plantilla_MD.md en la raíz del proyecto.")
@@ -84,10 +57,8 @@ def ensure_value(v: Any) -> str:
     if v is None:
         return "Sin datos"
     if isinstance(v, (dict, list)):
-        try:
-            v = json.dumps(v, ensure_ascii=False)
-        except Exception:
-            v = str(v)
+        try: v = json.dumps(v, ensure_ascii=False)
+        except Exception: v = str(v)
     v = str(v).strip()
     return v if v else "Sin datos"
 
@@ -95,14 +66,9 @@ def assemble_markdown(template_lines: List[str], fields: List[Dict[str, Any]], d
     out = template_lines[:]
     for f in fields:
         line = out[f["line_idx"]]
-        val = ensure_value(data.get(f["key"], ""))
+        val = ensure_value(data.get(f["key"], "Sin datos"))
         idx = line.rfind(":")
-        if idx == -1:
-            base = line.rstrip()
-            out[f["line_idx"]] = base + " " + val
-        else:
-            base = line[: idx + 1]
-            out[f["line_idx"]] = base + " " + val
+        out[f["line_idx"]] = (line.rstrip() + " " + val) if idx == -1 else (line[:idx+1] + " " + val)
     return "\n".join(out) + "\n"
 
 def normalize_user_data_to_keys(user_data: Dict[str, Any], expected_keys: List[str]) -> Dict[str, Any]:
@@ -119,7 +85,7 @@ def normalize_user_data_to_keys(user_data: Dict[str, Any], expected_keys: List[s
     return out
 
 async def ingest_user_data(request: Request) -> Dict[str, Any]:
-    # 1) JSON
+    # JSON
     try:
         payload = await request.json()
         if isinstance(payload, dict):
@@ -129,28 +95,26 @@ async def ingest_user_data(request: Request) -> Dict[str, Any]:
                 return payload
     except Exception:
         pass
-    # 2) Query
+    # Query
     try:
         qs = dict(request.query_params)
         if "user_data" in qs:
             try:
                 ud = json.loads(qs["user_data"])
-                if isinstance(ud, dict):
-                    return ud
+                if isinstance(ud, dict): return ud
             except Exception:
                 return {}
         elif qs:
             return qs
     except Exception:
         pass
-    # 3) Form
+    # Form
     try:
         form = await request.form()
         if "user_data" in form:
             try:
                 ud = json.loads(form["user_data"])
-                if isinstance(ud, dict):
-                    return ud
+                if isinstance(ud, dict): return ud
             except Exception:
                 return {}
         elif form:
@@ -159,61 +123,71 @@ async def ingest_user_data(request: Request) -> Dict[str, Any]:
         pass
     return {}
 
-# ========= OpenAI rules =========
+def strip_html(html: str) -> str:
+    # súper básico: fuera scripts/styles y tags
+    html = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", html)
+    html = re.sub(r"(?is)<[^>]+>", " ", html)
+    html = re.sub(r"\s+", " ", html)
+    return html.strip()
+
+async def fetch_site_text(url: str, timeout_s: int = 8) -> Optional[str]:
+    if not url: return None
+    if not url.startswith("http"):
+        url = "https://" + url
+    try:
+        async with httpx.AsyncClient(timeout=timeout_s, follow_redirects=True) as http:
+            r = await http.get(url)
+            if r.status_code >= 400:
+                log.warning("fetch_site_text: status=%s url=%s", r.status_code, url)
+                return None
+            text = strip_html(r.text)
+            # recortamos a 15k chars para el prompt
+            return text[:15000]
+    except Exception as e:
+        log.warning("fetch_site_text error: %r", e)
+        return None
+
 SYSTEM_RULES = """Sos un asistente que rellena un brief y responde SOLO en JSON (objeto).
 Reglas:
-- Prioridad: (1) Usuario, (2) Sitio oficial, (3) Secundarias confiables.
-- Si falta info: devolvé el string EXACTO "Sin datos".
-- Si hay contradicción fuerte con el usuario: usá el dato del usuario y agregá " (verificar internamente)".
+- Prioridad: (1) Usuario, (2) Sitio oficial provisto en 'website' (si hay), (3) Secundarias confiables.
+- Si falta info: devolver el string EXACTO "Sin datos".
+- Si hay contradicción fuerte con el usuario: usar el dato del usuario y agregar " (verificar internamente)".
 - No inventes datos sensibles ni números sin evidencia.
 - Devolvé un JSON con EXACTAMENTE las KEYS indicadas (sin keys extra).
 """
 
-def call_model_to_get_json(fields: List[Dict[str, Any]], payload: Dict[str, Any], debug: bool = False) -> Dict[str, str]:
-    keys_list = [f["key"] for f in fields]
-    user_text = json.dumps(payload, ensure_ascii=False, indent=2)
-
-    prompt = (
+def call_model_to_get_json(keys_list: List[str], user_payload: Dict[str, Any], web_context: Optional[str]) -> Dict[str, str]:
+    user_text = json.dumps(user_payload, ensure_ascii=False, indent=2)
+    user_msg = (
         "Estas son las KEYS a completar (usar EXACTAMENTE estas, sin agregar otras):\n"
         + ", ".join(keys_list)
-        + "\n\nDatos del usuario/hallazgos (pueden estar incompletos):\n"
+        + "\n\nDatos del usuario (pueden estar incompletos):\n"
         + user_text
-        + "\n\nDevolvé SOLO JSON válido (sin texto adicional)."
+        + "\n\nSi hay CONTEXTO_WEB, usalo como fuente secundaria. Devolvé SOLO JSON válido."
     )
-
-    messages = [
-        {"role": "system", "content": SYSTEM_RULES},
-        {"role": "user", "content": prompt},
-    ]
-
-    if debug:
-        logger.info("LLM prompt keys=%d payload_non_empty=%d", len(keys_list), sum(1 for v in payload.values() if v and v != "Sin datos"))
+    messages = [{"role": "system", "content": SYSTEM_RULES},
+                {"role": "user", "content": user_msg}]
+    if web_context:
+        messages.append({"role": "user", "content": "CONTEXTO_WEB (texto plano del sitio oficial):\n" + web_context})
 
     try:
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=messages,
             response_format={"type": "json_object"},
-            temperature=0.2,
+            temperature=0
         )
         raw = resp.choices[0].message.content
-        if debug:
-            logger.info("LLM raw (primeros 500 chars): %s", (raw or "")[:500])
         data = json.loads(raw)
         return {k: ensure_value(data.get(k, "Sin datos")) for k in keys_list}
     except Exception as e:
-        logger.exception("ERROR OpenAI (model=%s): %r", OPENAI_MODEL, e)
-        return {k: "Sin datos" for k in keys_list}
+        log.warning("OpenAI error: %r", e)
+        # Fallback: NO pisar los valores del usuario
+        return {k: ensure_value(user_payload.get(k, "Sin datos")) for k in keys_list}
 
-# ========= Endpoints =========
 @app.get("/health")
 def health():
-    return {
-        "ok": True,
-        "version": "1.0.8",
-        "model": OPENAI_MODEL,
-        "openai_configured": bool(OPENAI_API_KEY),
-    }
+    return {"ok": True, "version": "1.0.8", "model": OPENAI_MODEL}
 
 @app.get("/brief/keys", response_model=KeysResponse)
 def brief_keys():
@@ -222,35 +196,62 @@ def brief_keys():
     return KeysResponse(keys=[f["key"] for f in fields])
 
 @app.post("/brief/fill", response_model=FillResponse)
-async def fill_brief(
-    request: Request,
-    authorization: str = Header(None),
-    debug: int = Query(0, description="Set 1 para loguear prompts/respuestas LLM"),
-):
-    # Auth
+async def fill_brief(request: Request, authorization: str = Header(None)):
     expected = f"Bearer {SERVICE_TOKEN}" if SERVICE_TOKEN else None
     if expected and authorization != expected:
-        logger.warning("401 Unauthorized: authorization header incorrecto")
+        log.warning("401 Unauthorized")
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    # Ingesta
-    user_data = await ingest_user_data(request)
-    logger.info("Ingest user_data keys=%d sample=%s", len(user_data), list(user_data.keys())[:6])
+    # flags de control
+    qs = dict(request.query_params)
+    debug = qs.get("debug") in ("1","true","True","yes")
+    allow_ai_flag = False
 
-    # Plantilla y fields
+    # ingesta
+    user_data_in = await ingest_user_data(request)
+    # también permitimos allow_ai en el body
+    try:
+        body = await request.json()
+        if isinstance(body, dict):
+            allow_ai_flag = bool(body.get("allow_ai", False))
+    except Exception:
+        pass
+    if qs.get("allow_ai") in ("1","true","True","yes"):
+        allow_ai_flag = True
+
+    # plantilla
     _, template_lines = read_template()
     fields = extract_fields(template_lines)
-    if not fields:
-        raise HTTPException(status_code=400, detail="No se detectaron campos en la plantilla")
-
-    # Normalizar y completar con IA
     expected_keys = [f["key"] for f in fields]
-    normalized = normalize_user_data_to_keys(user_data, expected_keys)
-    non_empty = sum(1 for v in normalized.values() if v and v != "Sin datos")
-    logger.info("Normalized keys=%d non_empty=%d", len(normalized), non_empty)
 
-    data = call_model_to_get_json(fields, normalized, debug=bool(debug))
+    # normalizar y loggear
+    normalized = normalize_user_data_to_keys(user_data_in, expected_keys)
+    if debug:
+        sample = {k: normalized.get(k) for k in ["cliente_marca","website","sector","que_venden_1_frase"] if k in normalized}
+        log.info("INGEST allow_ai=%s normalized_sample=%s", allow_ai_flag, sample)
 
-    # Ensamblar markdown
-    md = assemble_markdown(template_lines, fields, data)
+    # contexto web (opcional)
+    web_ctx = None
+    if allow_ai_flag:
+        website = (normalized.get("website") or "").strip()
+        if website and website != "Sin datos":
+            web_ctx = await fetch_site_text(website)
+            if debug:
+                log.info("WEB_CTX chars=%s from=%s", len(web_ctx) if web_ctx else 0, website)
+
+    # IA (con fallback amistoso a user_data)
+    model_out = call_model_to_get_json(expected_keys, normalized, web_ctx)
+
+    # Merge “usuario primero, IA después” para no perder inputs usuario si IA puso "Sin datos".
+    merged: Dict[str, Any] = {}
+    for k in expected_keys:
+        user_val = ensure_value(normalized.get(k, "Sin datos"))
+        ai_val = ensure_value(model_out.get(k, "Sin datos"))
+        merged[k] = user_val if user_val != "Sin datos" else ai_val
+
+    if debug:
+        filled = sum(1 for k,v in merged.items() if v != "Sin datos")
+        log.info("FILL result filled_keys=%d/%d", filled, len(expected_keys))
+
+    md = assemble_markdown(template_lines, fields, merged)
     return FillResponse(markdown=md)
