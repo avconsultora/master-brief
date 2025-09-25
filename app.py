@@ -287,14 +287,28 @@ async def fill_brief(
     if expected and authorization != expected:
         logger.warning("401 Unauthorized attempt")
         raise HTTPException(status_code=401, detail="Unauthorized")
-
+    
+        # --- debug crudo de la solicitud ---
+    try:
+        body_bytes = await request.body()
+        print("DEBUG raw headers:", dict(request.headers))
+        print("DEBUG raw query:", dict(request.query_params))
+        print("DEBUG raw body bytes len:", len(body_bytes))
+        print("DEBUG raw body (trunc 500):", body_bytes[:500])
+    except Exception as e:
+        print("DEBUG error leyendo body:", repr(e))
+    # -----------------------------------
+    
     # 1) Ingesta
     user_data = await ingest_user_data(request)
     try:
         logger.info(f"INGEST keys_in={len(user_data)} sample={list(user_data.keys())[:5]}")
     except Exception:
         pass
+    # -----------------------------------
+    print("DEBUG user_data (post-ingest):", {k: user_data.get(k) for k in list(user_data.keys())[:8]})
 
+    # -----------------------------------
     # 2) Plantilla / keys oficiales
     template_text, template_lines = read_template()
     fields = extract_fields(template_lines)
